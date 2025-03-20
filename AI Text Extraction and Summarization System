@@ -1,0 +1,304 @@
+# Text Extraction and Summarization System
+# This implementation uses Hugging Face transformers to build a custom model
+# and exposes it through a Flask API
+
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+from flask import Flask, request, jsonify
+import nltk
+from nltk.tokenize import sent_tokenize
+import logging
+import os
+
+# Download NLTK resources for sentence tokenization
+nltk.download('punkt', quiet=True)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+class TextProcessor:
+    def __init__(self):
+        # Load pre-trained models
+        logger.info("Initializing models...")
+        
+        # Model for summarization
+        self.summary_model_name = "facebook/bart-large-cnn"
+        self.summary_tokenizer = AutoTokenizer.from_pretrained(self.summary_model_name)
+        self.summary_model = AutoModelForSeq2SeqLM.from_pretrained(self.summary_model_name)
+        self.summarizer = pipeline("summarization", model=self.summary_model, tokenizer=self.summary_tokenizer)
+        
+        # Model for key information extraction
+        self.extraction_model_name = "distilbert-base-cased-distilled-squad"
+        self.extractor = pipeline("question-answering", model=self.extraction_model_name)
+        
+        logger.info("Models initialized successfully!")
+        
+    def extract_information(self, text, questions):
+        """
+        Extract specific information from text based on provided questions
+        
+        Args:
+            text (str): The source text
+            questions (list): List of questions to answer from the text
+            
+        Returns:
+            list: Extracted answers to each question
+        """
+        results = []
+        
+        for question in questions:
+            try:
+                answer = self.extractor(question=question, context=text)
+                results.append({
+                    "question": question,
+                    "answer": answer["answer"],
+                    "confidence": round(float(answer["score"]), 4)
+                })
+            except Exception as e:
+                logger.error(f"Error extracting answer for question '{question}': {str(e)}")
+                results.append({
+                    "question": question,
+                    "answer": "Extraction failed",
+                    "confidence": 0.0
+                })
+                
+        return results
+    
+    def generate_summary(self, text, max_length=150, min_length=30):
+        """
+        Generate a concise summary of the provided text
+        
+        Args:
+            text (str): Text to summarize
+            max_length (int): Maximum length of summary in tokens
+            min_length (int): Minimum length of summary in tokens
+            
+        Returns:
+            str: Generated summary
+        """
+        try:
+            # Handle long texts by chunking
+            if len(text.split()) > 1000:
+                return self._summarize_long_text(text, max_length, min_length)
+            
+            # For shorter texts, summarize directly
+            summary = self.summarizer(text, max_length=max_length, min_length=min_length, do_sample=False)
+            return summary[0]['summary_text']
+            
+        except Exception as e:
+            logger.error(f"Error generating summary: {str(e)}")
+            return "Summary generation failed"
+    
+    def _summarize_long_text(self, text, max_length=150, min_length=30):
+        """Helper method to summarize long texts by chunking"""
+        # Split text into sentences
+        sentences = sent_tokenize(text)
+        
+        # Create chunks of ~1000 words
+        chunks = []
+        current_chunk = []
+        current_chunk_len = 0
+        
+        for sentence in sentences:
+            sentence_len = len(sentence.split())
+            if current_chunk_len + sentence_len <= 1000:
+                current_chunk.append(sentence)
+                current_chunk_len += sentence_len
+            else:
+                chunks.append(" ".join(current_chunk))
+                current_chunk = [sentence]
+                current_chunk_len = sentence_len
+                
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
+            
+        # Summarize each chunk
+        chunk_summaries = []
+        for chunk in chunks:
+            summary = self.summarizer(chunk, max_length=max(30, max_length // len(chunks)), 
+                                      min_length=min(15, min_length // len(chunks)), 
+                                      do_sample=False)
+            chunk_summaries.append(summary[0]['summary_text'])
+            
+        # Combine chunk summaries and generate final summary
+        combined_summary = " ".join(chunk_summaries)
+        
+        # If combined summaries are still too long, summarize again
+        if len(combined_summary.split()) > 500:
+            final_summary = self.summarizer(combined_summary, max_length=max_length, 
+                                           min_length=min_length, 
+                                           do_sample=False)
+            return final_summary[0]['summary_text']
+        
+        return combined_summary
+    
+    def analyze_text(self, text, questions=None, generate_summary=True, max_summary_length=150):
+        """
+        Comprehensive text analysis: extraction and summarization
+        
+        Args:
+            text (str): Input text to analyze
+            questions (list, optional): Questions to extract answers for
+            generate_summary (bool): Whether to generate a summary
+            max_summary_length (int): Maximum summary length
+            
+        Returns:
+            dict: Analysis results
+        """
+        results = {}
+        
+        # Generate summary if requested
+        if generate_summary:
+            results["summary"] = self.generate_summary(text, max_length=max_summary_length)
+            
+        # Extract information if questions provided
+        if questions:
+            results["extracted_info"] = self.extract_information(text, questions)
+            
+        return results
+    
+    def fine_tune(self, training_data, model_output_dir="./fine_tuned_model"):
+        """
+        Fine-tune the summarization model on domain-specific data
+        
+        Args:
+            training_data (list): List of dicts with 'text' and 'summary' keys
+            model_output_dir (str): Directory to save the fine-tuned model
+            
+        Returns:
+            bool: Success status
+        """
+        try:
+            from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments, DataCollatorForSeq2Seq
+            import numpy as np
+            from datasets import Dataset
+            
+            # Prepare dataset
+            train_dataset = Dataset.from_dict({
+                'text': [item['text'] for item in training_data],
+                'summary': [item['summary'] for item in training_data]
+            })
+            
+            # Tokenize dataset
+            def preprocess_function(examples):
+                inputs = self.summary_tokenizer(examples['text'], max_length=1024, truncation=True, padding="max_length")
+                outputs = self.summary_tokenizer(examples['summary'], max_length=128, truncation=True, padding="max_length")
+                
+                batch = {
+                    "input_ids": inputs.input_ids,
+                    "attention_mask": inputs.attention_mask,
+                    "labels": outputs.input_ids,
+                }
+                # Replace padding token id's with -100 so they're ignored in loss calculation
+                batch["labels"] = [[-100 if token == self.summary_tokenizer.pad_token_id else token for token in labels] 
+                                  for labels in batch["labels"]]
+                
+                return batch
+            
+            tokenized_dataset = train_dataset.map(preprocess_function, batched=True)
+            
+            # Define training arguments
+            training_args = Seq2SeqTrainingArguments(
+                output_dir=model_output_dir,
+                per_device_train_batch_size=4,
+                num_train_epochs=3,
+                save_steps=500,
+                save_total_limit=2,
+                prediction_loss_only=True,
+                fp16=torch.cuda.is_available(),  # Use mixed precision if GPU available
+            )
+            
+            # Data collator
+            data_collator = DataCollatorForSeq2Seq(self.summary_tokenizer, model=self.summary_model)
+            
+            # Initialize trainer
+            trainer = Seq2SeqTrainer(
+                model=self.summary_model,
+                args=training_args,
+                train_dataset=tokenized_dataset,
+                data_collator=data_collator,
+            )
+            
+            # Train model
+            trainer.train()
+            
+            # Save fine-tuned model
+            self.summary_model.save_pretrained(model_output_dir)
+            self.summary_tokenizer.save_pretrained(model_output_dir)
+            
+            # Update the pipeline with fine-tuned model
+            self.summary_model = AutoModelForSeq2SeqLM.from_pretrained(model_output_dir)
+            self.summarizer = pipeline("summarization", model=self.summary_model, tokenizer=self.summary_tokenizer)
+            
+            logger.info(f"Model fine-tuning completed and saved to {model_output_dir}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error during fine-tuning: {str(e)}")
+            return False
+
+
+# Initialize the text processor
+text_processor = TextProcessor()
+
+@app.route('/analyze', methods=['POST'])
+def analyze_text():
+    """API endpoint for text analysis"""
+    try:
+        data = request.json
+        
+        if not data or 'text' not in data:
+            return jsonify({"error": "No text provided"}), 400
+            
+        text = data['text']
+        questions = data.get('questions', [])
+        generate_summary = data.get('generate_summary', True)
+        max_summary_length = data.get('max_summary_length', 150)
+        
+        results = text_processor.analyze_text(
+            text=text,
+            questions=questions,
+            generate_summary=generate_summary,
+            max_summary_length=max_summary_length
+        )
+        
+        return jsonify(results)
+        
+    except Exception as e:
+        logger.error(f"Error in /analyze endpoint: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/fine-tune', methods=['POST'])
+def fine_tune():
+    """API endpoint for model fine-tuning"""
+    try:
+        data = request.json
+        
+        if not data or 'training_data' not in data:
+            return jsonify({"error": "No training data provided"}), 400
+            
+        training_data = data['training_data']
+        model_output_dir = data.get('model_output_dir', './fine_tuned_model')
+        
+        success = text_processor.fine_tune(training_data, model_output_dir)
+        
+        if success:
+            return jsonify({"status": "success", "message": "Model fine-tuning completed"})
+        else:
+            return jsonify({"status": "error", "message": "Model fine-tuning failed"}), 500
+            
+    except Exception as e:
+        logger.error(f"Error in /fine-tune endpoint: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """API endpoint for health check"""
+    return jsonify({"status": "healthy", "models": [text_processor.summary_model_name, text_processor.extraction_model_name]})
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
